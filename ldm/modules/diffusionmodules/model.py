@@ -5,6 +5,10 @@ import torch.nn as nn
 import numpy as np
 from einops import rearrange
 from typing import Optional, Any
+import torch.nn.functional as F
+from typing import Optional, Union
+from xformers.ops.fmha import AttentionOp, AttentionBias
+import torch.utils.checkpoint as checkpoint
 
 from ldm.modules.attention import MemoryEfficientCrossAttention
 
@@ -15,6 +19,40 @@ try:
 except:
     XFORMERS_IS_AVAILBLE = False
     print("No module 'xformers'. Proceeding without it.")
+
+
+def memory_efficient_attention_with_checkpoint(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_bias: Optional[AttentionBias] = None,
+    op: Optional[Union[AttentionOp, str]] = None,
+    dropout_p: float = 0.0,
+) -> torch.Tensor:
+    B, M, H = query.shape
+    K = key.shape[-1]
+
+    query = query.view(B, M, 1, H)
+    key = key.view(B, M, 1, K)
+    value = value.view(B, M, 1, K)
+
+    def _compute_attention(query, key, value, attn_bias, op, dropout_p):
+        B, M, H, K = query.shape
+        scale = None
+        scale = 1 / K ** 0.5 if scale is None else scale
+        query = query * scale
+        attn = torch.matmul(query, key.transpose(-2, -1))
+
+        if attn_bias is not None:
+            attn = attn + attn_bias
+
+        attn = F.softmax(attn, dim=-1)
+        attn = F.dropout(attn, dropout_p) 
+        return torch.matmul(attn, value)
+
+    # Use checkpoint to reduce memory usage
+    result = checkpoint.checkpoint(_compute_attention, query, key, value, attn_bias, op, dropout_p) 
+    return result
 
 
 def get_timestep_embedding(timesteps, embedding_dim):
@@ -255,7 +293,11 @@ class MemoryEfficientAttnBlock(nn.Module):
             .contiguous(),
             (q, k, v),
         )
-        out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
+        # Old line:
+        # out = xformers.ops.memory_efficient_attention(q, k, v, attn_bias=None, op=self.attention_op)
+
+        # New line:
+        out = memory_efficient_attention_with_checkpoint(q, k, v, attn_bias=None, op=self.attention_op)
 
         out = (
             out.unsqueeze(0)
